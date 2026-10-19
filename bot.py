@@ -144,8 +144,11 @@ def format_room(r):
     building, number = r["building"], r["number"]
     if building.startswith("*дист"):
         return "дистанционно"
-    building = re.sub(r"^К\.,\s*", "", building)
-    return f"корп. {building}, ауд. {number}"
+    if re.fullmatch(r"[IVXLC]+", number):  # римская цифра — это «Римка»
+        return f"Римка {number}"
+    if number.isdigit():
+        return f"ауд. {number}"
+    return number  # например, ФОК
 
 
 def format_lesson(x, index=None):
