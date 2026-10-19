@@ -5,6 +5,7 @@ import re
 import threading
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 
 import requests
@@ -18,6 +19,9 @@ CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "900"))
 WATCH_DAYS = int(os.environ.get("WATCH_DAYS", "14"))
 API_TIMEOUT = 30
 API_RETRIES = 3
+RATE_LIMIT = 5  # не больше стольких действий от одного человека...
+RATE_WINDOW = 30  # ...за столько секунд
+CACHE_TTL = 60  # расписание дня держим в памяти столько секунд
 
 API = "https://usla.unmp.ru/api/app/v1"
 TG = f"https://api.telegram.org/bot{TOKEN}"
@@ -46,6 +50,18 @@ KEYBOARD = {
 }
 
 state_lock = threading.Lock()
+user_actions = {}
+day_cache = {}
+
+
+def rate_limited(user_id):
+    now = time.time()
+    recent = [t for t in user_actions.get(user_id, []) if now - t < RATE_WINDOW]
+    limited = len(recent) >= RATE_LIMIT
+    if not limited:
+        recent.append(now)
+    user_actions[user_id] = recent
+    return limited
 
 
 def load_state():
@@ -93,8 +109,15 @@ def api_get(path, params):
 
 
 def fetch_day(day):
+    cached = day_cache.get(day)
+    if cached and time.time() - cached[0] < CACHE_TTL:
+        return cached[1]
     data = api_get(f"schedule/group/{GROUP_ID}", {"date": day.isoformat()})["data"]
-    return sorted(data, key=lambda x: x["startTime"])
+    lessons = sorted(data, key=lambda x: x["startTime"])
+    if len(day_cache) > 200:  # даты вводят вручную, не даём кэшу расти бесконечно
+        day_cache.clear()
+    day_cache[day] = (time.time(), lessons)
+    return lessons
 
 
 def fetch_range(start, end):
@@ -227,6 +250,9 @@ def handle_message(state, msg):
     text = msg.get("text", "")
     if chat_id is None:
         return
+    # Спамера молча игнорируем: ответ на каждое сообщение только добавил бы спама
+    if rate_limited(msg.get("from", {}).get("id", chat_id)):
+        return
 
     if text.startswith("/start"):
         if chat_id not in state["subscribers"]:
@@ -249,10 +275,14 @@ def handle_message(state, msg):
 
 
 def handle_callback(cb):
-    requests.post(f"{TG}/answerCallbackQuery", json={"callback_query_id": cb["id"]}, timeout=15)
     chat_id = cb.get("message", {}).get("chat", {}).get("id")
     data = cb.get("data", "")
-    if chat_id is None:
+    answer = {"callback_query_id": cb["id"]}
+    limited = rate_limited(cb.get("from", {}).get("id", chat_id))
+    if limited:
+        answer["text"] = "⏳ Не так быстро, подождите немного"
+    requests.post(f"{TG}/answerCallbackQuery", json=answer, timeout=15)
+    if limited or chat_id is None:
         return
 
     if data.startswith("d:"):
@@ -261,8 +291,19 @@ def handle_callback(cb):
         send(chat_id, "Напишите дату в формате ДД.ММ или ДД.ММ.ГГГГ, например 25.10")
 
 
+def process_update(state, update):
+    try:
+        if "callback_query" in update:
+            handle_callback(update["callback_query"])
+        elif "message" in update:
+            handle_message(state, update["message"])
+    except Exception:
+        traceback.print_exc()
+
+
 def main():
     state = load_state()
+    pool = ThreadPoolExecutor(max_workers=8)
     threading.Thread(target=watcher, args=(state,), daemon=True).start()
 
     offset = None
@@ -276,13 +317,8 @@ def main():
                 continue
             for update in body["result"]:
                 offset = update["update_id"] + 1
-                try:
-                    if "callback_query" in update:
-                        handle_callback(update["callback_query"])
-                    elif "message" in update:
-                        handle_message(state, update["message"])
-                except Exception:
-                    traceback.print_exc()
+                # Параллельно, чтобы медленный запрос одного человека не тормозил остальных
+                pool.submit(process_update, state, update)
         except requests.RequestException as e:
             print("Ошибка сети:", e)
             time.sleep(5)
