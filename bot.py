@@ -52,9 +52,13 @@ def load_state():
     except FileNotFoundError:
         state = {}
     # None вместо пустого словаря: первый запуск отличаем от «пар нет»
-    # CHAT_ID из окружения нужен хостингам, где диск стирается при перезапуске
-    chat_id = state.get("chat_id") or os.environ.get("CHAT_ID")
-    return {"chat_id": int(chat_id) if chat_id else None, "days": state.get("days")}
+    subscribers = list(state.get("subscribers", []))
+    if state.get("chat_id"):  # старый формат: один чат
+        subscribers.append(state["chat_id"])
+    # CHAT_IDS из окружения (через запятую) нужны хостингам, где диск стирается при перезапуске
+    env_ids = os.environ.get("CHAT_IDS") or os.environ.get("CHAT_ID", "")
+    subscribers += [int(x) for x in env_ids.split(",") if x.strip()]
+    return {"subscribers": list(dict.fromkeys(subscribers)), "days": state.get("days")}
 
 
 def save_state(state):
@@ -201,9 +205,13 @@ def watcher(state):
         try:
             start = today()
             new = fetch_range(start, start + timedelta(days=WATCH_DAYS - 1))
-            if state["days"] is not None and state["chat_id"]:
+            if state["days"] is not None and state["subscribers"]:
                 for line in diff(state["days"], new):
-                    send(state["chat_id"], line)
+                    for chat_id in list(state["subscribers"]):
+                        try:
+                            send(chat_id, line)
+                        except Exception as e:  # например, пользователь заблокировал бота
+                            print(f"Не удалось отправить в {chat_id}:", e)
             state["days"] = new
             save_state(state)
         except Exception as e:
@@ -218,9 +226,15 @@ def handle_message(state, msg):
         return
 
     if text.startswith("/start"):
-        state["chat_id"] = chat_id
-        save_state(state)
+        if chat_id not in state["subscribers"]:
+            state["subscribers"].append(chat_id)
+            save_state(state)
         send(chat_id, "👋 Какой день?", keyboard=True)
+    elif text.startswith("/stop"):
+        if chat_id in state["subscribers"]:
+            state["subscribers"].remove(chat_id)
+            save_state(state)
+        send(chat_id, "🔕 Уведомления выключены. Вернуть: /start")
     elif text.startswith("/schedule"):
         show_day(chat_id, today())
     else:
