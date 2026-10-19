@@ -49,6 +49,9 @@ KEYBOARD = {
     ]
 }
 
+KNOWN_COMMANDS = {"/rasp", "/rasp_off", "/start", "/stop", "/schedule"}
+BOT_USERNAME = None  # узнаём у Telegram при запуске
+
 state_lock = threading.Lock()
 user_actions = {}
 day_cache = {}
@@ -245,33 +248,54 @@ def watcher(state):
         time.sleep(CHECK_INTERVAL)
 
 
+def parse_command(text):
+    """'/rasp@my_bot arg' -> ('/rasp', 'my_bot'); не команда -> (None, None)."""
+    if not text.startswith("/"):
+        return None, None
+    command, _, target = text.split()[0].partition("@")
+    return command.lower(), target or None
+
+
 def handle_message(state, msg):
-    chat_id = msg.get("chat", {}).get("id")
+    chat = msg.get("chat", {})
+    chat_id = chat.get("id")
     text = msg.get("text", "")
     if chat_id is None:
         return
+    user_id = msg.get("from", {}).get("id", chat_id)
+
+    command, target = parse_command(text)
+    if target and BOT_USERNAME and target.lower() != BOT_USERNAME.lower():
+        return  # команда адресована другому боту в этом чате
+    if command and command not in KNOWN_COMMANDS:
+        return  # чужая команда, в общем чате на неё отвечают другие боты
+    if command in ("/start", "/stop") and not target and chat.get("type") != "private":
+        return  # в группе общий /start предназначен всем ботам сразу, у нас для этого /rasp
+
+    day = None if command else parse_date(text)
+    if not command and day is None:
+        # В личке подсказываем формат, в групповом чате молчим: там обычная переписка
+        if chat.get("type") == "private" and not rate_limited(user_id):
+            send(chat_id, "Не понял дату. Напишите ДД.ММ или ДД.ММ.ГГГГ, например 25.10", keyboard=True)
+        return
     # Спамера молча игнорируем: ответ на каждое сообщение только добавил бы спама
-    if rate_limited(msg.get("from", {}).get("id", chat_id)):
+    if rate_limited(user_id):
         return
 
-    if text.startswith("/start"):
+    if command in ("/rasp", "/start"):
         if chat_id not in state["subscribers"]:
             state["subscribers"].append(chat_id)
             save_state(state)
         send(chat_id, "👋 Какой день?", keyboard=True)
-    elif text.startswith("/stop"):
+    elif command in ("/rasp_off", "/stop"):
         if chat_id in state["subscribers"]:
             state["subscribers"].remove(chat_id)
             save_state(state)
-        send(chat_id, "🔕 Уведомления выключены. Вернуть: /start")
-    elif text.startswith("/schedule"):
+        send(chat_id, "🔕 Уведомления выключены. Вернуть: /rasp")
+    elif command == "/schedule":
         show_day(chat_id, today())
     else:
-        day = parse_date(text)
-        if day is None:
-            send(chat_id, "Не понял дату. Напишите ДД.ММ или ДД.ММ.ГГГГ, например 25.10", keyboard=True)
-        else:
-            show_day(chat_id, day)
+        show_day(chat_id, day)
 
 
 def handle_callback(cb):
@@ -302,8 +326,19 @@ def process_update(state, update):
 
 
 def main():
+    global BOT_USERNAME
     state = load_state()
     pool = ThreadPoolExecutor(max_workers=8)
+
+    try:
+        BOT_USERNAME = requests.get(f"{TG}/getMe", timeout=15).json()["result"]["username"]
+        commands = [
+            {"command": "rasp", "description": "Расписание и уведомления"},
+            {"command": "rasp_off", "description": "Отключить уведомления"},
+        ]
+        requests.post(f"{TG}/setMyCommands", json={"commands": commands}, timeout=15)
+    except Exception as e:
+        print("Не удалось получить имя бота или задать команды:", e)
     threading.Thread(target=watcher, args=(state,), daemon=True).start()
 
     offset = None
