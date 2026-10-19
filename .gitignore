@@ -1,4 +1,5 @@
 run.bat
 state.json
+users.db
 __pycache__/
 *.pyc

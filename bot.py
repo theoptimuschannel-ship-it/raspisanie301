@@ -1,7 +1,10 @@
+import csv
 import html
+import io
 import json
 import os
 import re
+import sqlite3
 import threading
 import time
 import traceback
@@ -22,6 +25,10 @@ API_RETRIES = 3
 RATE_LIMIT = 5  # не больше стольких действий от одного человека...
 RATE_WINDOW = 30  # ...за столько секунд
 CACHE_TTL = 60  # расписание дня держим в памяти столько секунд
+# Telegram ID админов через запятую; узнать свой можно командой /myid
+ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()}
+# Если у хостинга есть постоянный диск, укажите путь на нём, иначе база стирается при пересборке
+DB_PATH = os.environ.get("DB_PATH") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "users.db")
 
 API = "https://usla.unmp.ru/api/app/v1"
 TG = f"https://api.telegram.org/bot{TOKEN}"
@@ -49,10 +56,25 @@ KEYBOARD = {
     ]
 }
 
-KNOWN_COMMANDS = {"/rasp", "/rasp_off", "/start", "/stop", "/schedule"}
+ADMIN_KEYBOARD = {
+    "inline_keyboard": [
+        [
+            {"text": "📊 Сводка", "callback_data": "adm:summary"},
+            {"text": "🏆 Топ", "callback_data": "adm:top"},
+        ],
+        [
+            {"text": "🆕 Новые", "callback_data": "adm:new"},
+            {"text": "📥 CSV", "callback_data": "adm:csv"},
+        ],
+    ]
+}
+
+KNOWN_COMMANDS = {"/rasp", "/rasp_off", "/start", "/stop", "/schedule", "/admin", "/myid"}
 BOT_USERNAME = None  # узнаём у Telegram при запуске
 
 state_lock = threading.Lock()
+db_lock = threading.Lock()
+_db = None
 user_actions = {}
 day_cache = {}
 
@@ -91,6 +113,68 @@ def save_state(state):
 
 def today():
     return datetime.now(TZ).date()
+
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT,
+    first_seen TEXT, last_seen TEXT, actions INTEGER DEFAULT 0, registered_at TEXT
+);
+CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, chat_id INTEGER, kind TEXT, ts TEXT
+);
+CREATE TABLE IF NOT EXISTS chats (
+    chat_id INTEGER PRIMARY KEY, type TEXT, title TEXT, first_seen TEXT
+);
+"""
+
+
+def get_db():
+    """Вызывать только под db_lock."""
+    global _db
+    if _db is None:
+        _db = sqlite3.connect(DB_PATH, check_same_thread=False)
+        _db.executescript(SCHEMA)
+    return _db
+
+
+def db_query(sql, args=()):
+    with db_lock:
+        return get_db().execute(sql, args).fetchall()
+
+
+def track(user, chat, kind, register=False):
+    """Записываем, кто и что сделал. Сбой базы не должен ломать бота."""
+    if not user or user.get("is_bot"):
+        return
+    now = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
+    chat_title = chat.get("title") or chat.get("username") or chat.get("first_name")
+    try:
+        with db_lock:
+            db = get_db()
+            db.execute(
+                "INSERT INTO users(user_id, username, first_name, first_seen, last_seen) VALUES(?,?,?,?,?) "
+                "ON CONFLICT(user_id) DO UPDATE SET username=excluded.username, "
+                "first_name=excluded.first_name, last_seen=excluded.last_seen",
+                (user["id"], user.get("username"), user.get("first_name"), now, now),
+            )
+            db.execute("UPDATE users SET actions = actions + 1 WHERE user_id = ?", (user["id"],))
+            if register:
+                db.execute(
+                    "UPDATE users SET registered_at = COALESCE(registered_at, ?) WHERE user_id = ?",
+                    (now, user["id"]),
+                )
+            db.execute(
+                "INSERT INTO events(user_id, chat_id, kind, ts) VALUES(?,?,?,?)",
+                (user["id"], chat.get("id"), kind, now),
+            )
+            db.execute(
+                "INSERT OR IGNORE INTO chats(chat_id, type, title, first_seen) VALUES(?,?,?,?)",
+                (chat.get("id"), chat.get("type"), chat_title, now),
+            )
+            db.commit()
+    except Exception:
+        traceback.print_exc()
 
 
 def day_label(day):
@@ -211,10 +295,10 @@ def diff(old_days, new_days):
     return lines
 
 
-def send(chat_id, text, keyboard=False):
+def send(chat_id, text, keyboard=False, markup=None):
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
-    if keyboard:
-        payload["reply_markup"] = KEYBOARD
+    if markup or keyboard:
+        payload["reply_markup"] = markup or KEYBOARD
     r = requests.post(f"{TG}/sendMessage", json=payload, timeout=15)
     if not r.ok:
         print("Telegram отклонил сообщение:", r.text)
@@ -230,6 +314,86 @@ def show_day(chat_id, day):
     except Exception as e:
         print("Ошибка загрузки расписания:", e)
         send(chat_id, "Не удалось получить расписание, попробуйте позже.", keyboard=True)
+
+
+GROUP_CHATS_SQL = "SELECT COUNT(*) FROM chats WHERE type IN ('group', 'supergroup')"
+
+
+def user_label(first_name, username):
+    name = html.escape(first_name or "без имени")
+    return f"{name} (@{html.escape(username)})" if username else name
+
+
+def admin_summary(state):
+    t = today()
+    day, week = t.isoformat(), (t - timedelta(days=6)).isoformat()
+
+    def one(sql, *args):
+        return db_query(sql, args)[0][0]
+
+    return "\n".join([
+        "📊 <b>Сводка</b>",
+        "",
+        f"👥 Пользователей: <b>{one('SELECT COUNT(*) FROM users')}</b>",
+        f"✅ Зарегистрировались: <b>{one('SELECT COUNT(*) FROM users WHERE registered_at IS NOT NULL')}</b>",
+        "🆕 Новых сегодня / за 7 дней: "
+        f"<b>{one('SELECT COUNT(*) FROM users WHERE first_seen >= ?', day)}</b> / "
+        f"<b>{one('SELECT COUNT(*) FROM users WHERE first_seen >= ?', week)}</b>",
+        "🔥 Активных сегодня / за 7 дней: "
+        f"<b>{one('SELECT COUNT(DISTINCT user_id) FROM events WHERE ts >= ?', day)}</b> / "
+        f"<b>{one('SELECT COUNT(DISTINCT user_id) FROM events WHERE ts >= ?', week)}</b>",
+        "👆 Действий всего / сегодня: "
+        f"<b>{one('SELECT COUNT(*) FROM events')}</b> / "
+        f"<b>{one('SELECT COUNT(*) FROM events WHERE ts >= ?', day)}</b>",
+        "💬 Чатов / из них групп: "
+        f"<b>{one('SELECT COUNT(*) FROM chats')}</b> / "
+        f"<b>{one(GROUP_CHATS_SQL)}</b>",
+        f"🔔 Подписано на уведомления: <b>{len(state['subscribers'])}</b>",
+    ])
+
+
+def admin_top():
+    rows = db_query("SELECT first_name, username, actions FROM users ORDER BY actions DESC LIMIT 10")
+    if not rows:
+        return "🏆 Пока никого нет"
+    lines = [f"{i}. {user_label(n, u)} — <b>{a}</b>" for i, (n, u, a) in enumerate(rows, 1)]
+    return "🏆 <b>Топ по активности</b>\n\n" + "\n".join(lines)
+
+
+def admin_new():
+    rows = db_query(
+        "SELECT first_name, username, first_seen, registered_at FROM users ORDER BY first_seen DESC LIMIT 10"
+    )
+    if not rows:
+        return "🆕 Пока никого нет"
+    lines = [
+        f"{fs[8:10]}.{fs[5:7]} {fs[11:16]} · {user_label(n, u)}" + (" ✅" if reg else "")
+        for n, u, fs, reg in rows
+    ]
+    return "🆕 <b>Последние новые</b> (✅ — зарегистрировался)\n\n" + "\n".join(lines)
+
+
+def send_csv(chat_id):
+    rows = db_query(
+        "SELECT user_id, username, first_name, first_seen, last_seen, actions, registered_at "
+        "FROM users ORDER BY actions DESC"
+    )
+    buf = io.StringIO(newline="")
+    writer = csv.writer(buf)
+    writer.writerow(["user_id", "username", "first_name", "first_seen", "last_seen", "actions", "registered_at"])
+    writer.writerows(rows)
+    data = buf.getvalue().encode("utf-8-sig")  # BOM, чтобы Excel открыл кириллицу
+    requests.post(
+        f"{TG}/sendDocument", data={"chat_id": chat_id}, files={"document": ("users.csv", data)}, timeout=30
+    )
+
+
+def admin_action(state, chat_id, action):
+    if action == "csv":
+        send_csv(chat_id)
+        return
+    texts = {"summary": lambda: admin_summary(state), "top": admin_top, "new": admin_new}
+    send(chat_id, texts[action](), markup=ADMIN_KEYBOARD)
 
 
 def watcher(state):
@@ -275,6 +439,12 @@ def handle_message(state, msg):
     if command in ("/start", "/stop") and not target and chat.get("type") != "private":
         return  # в группе общий /start предназначен всем ботам сразу, у нас для этого /rasp
 
+    if command == "/admin":
+        # Только админам и только в личке; остальным не отвечаем, чтобы не раскрывать панель
+        if user_id in ADMIN_IDS and chat.get("type") == "private":
+            send(chat_id, "🛠 <b>Админ-панель</b>", markup=ADMIN_KEYBOARD)
+        return
+
     day = None if command else parse_date(text)
     if not command and day is None:
         # В личке подсказываем формат, в групповом чате молчим: там обычная переписка
@@ -285,27 +455,44 @@ def handle_message(state, msg):
     if rate_limited(user_id):
         return
 
-    if command in ("/rasp", "/start"):
+    if command == "/myid":
+        send(chat_id, f"Ваш Telegram ID: <code>{user_id}</code>")
+        return
+
+    kinds = {"/rasp": "start", "/start": "start", "/rasp_off": "stop", "/stop": "stop", "/schedule": "schedule"}
+    kind = kinds.get(command, "date")
+    track(msg.get("from"), chat, kind, register=kind == "start")
+
+    if kind == "start":
         if chat_id not in state["subscribers"]:
             state["subscribers"].append(chat_id)
             save_state(state)
         send(chat_id, "👋 Какой день?", keyboard=True)
-    elif command in ("/rasp_off", "/stop"):
+    elif kind == "stop":
         if chat_id in state["subscribers"]:
             state["subscribers"].remove(chat_id)
             save_state(state)
         send(chat_id, "🔕 Уведомления выключены. Вернуть: /rasp")
-    elif command == "/schedule":
+    elif kind == "schedule":
         show_day(chat_id, today())
     else:
         show_day(chat_id, day)
 
 
-def handle_callback(cb):
-    chat_id = cb.get("message", {}).get("chat", {}).get("id")
+def handle_callback(state, cb):
+    chat = cb.get("message", {}).get("chat", {})
+    chat_id = chat.get("id")
     data = cb.get("data", "")
+    user = cb.get("from", {})
     answer = {"callback_query_id": cb["id"]}
-    limited = rate_limited(cb.get("from", {}).get("id", chat_id))
+
+    if data.startswith("adm:"):
+        requests.post(f"{TG}/answerCallbackQuery", json=answer, timeout=15)
+        if user.get("id") in ADMIN_IDS and chat.get("type") == "private":
+            admin_action(state, chat_id, data[4:])
+        return
+
+    limited = rate_limited(user.get("id", chat_id))
     if limited:
         answer["text"] = "⏳ Не так быстро, подождите немного"
     requests.post(f"{TG}/answerCallbackQuery", json=answer, timeout=15)
@@ -313,15 +500,17 @@ def handle_callback(cb):
         return
 
     if data.startswith("d:"):
+        track(user, chat, data)
         show_day(chat_id, today() + timedelta(days=int(data[2:])))
     elif data == "custom":
+        track(user, chat, "custom")
         send(chat_id, "Напишите дату в формате ДД.ММ или ДД.ММ.ГГГГ, например 25.10")
 
 
 def process_update(state, update):
     try:
         if "callback_query" in update:
-            handle_callback(update["callback_query"])
+            handle_callback(state, update["callback_query"])
         elif "message" in update:
             handle_message(state, update["message"])
     except Exception:
@@ -338,6 +527,7 @@ def main():
         commands = [
             {"command": "rasp", "description": "Расписание и уведомления"},
             {"command": "rasp_off", "description": "Отключить уведомления"},
+            {"command": "myid", "description": "Узнать свой Telegram ID"},
         ]
         requests.post(f"{TG}/setMyCommands", json={"commands": commands}, timeout=15)
     except Exception as e:
