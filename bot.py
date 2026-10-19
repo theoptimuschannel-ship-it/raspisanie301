@@ -9,7 +9,10 @@ from datetime import date, datetime, timedelta, timezone
 
 import requests
 
-TOKEN = os.environ["TG_TOKEN"]
+# Хостинги по-разному называют переменную с токеном
+TOKEN = os.environ.get("TG_TOKEN") or os.environ.get("BOT_TOKEN") or os.environ.get("TOKEN")
+if not TOKEN:
+    raise SystemExit("Не задан токен бота: добавьте переменную окружения TG_TOKEN (или BOT_TOKEN)")
 GROUP_ID = os.environ.get("GROUP_ID", "729")  # ИПиП301Б_2024
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "900"))
 WATCH_DAYS = int(os.environ.get("WATCH_DAYS", "14"))
