@@ -139,6 +139,7 @@ def get_db():
     """Вызывать только под db_lock."""
     global _db
     if _db is None:
+        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
         _db = sqlite3.connect(DB_PATH, check_same_thread=False)
         _db.executescript(SCHEMA)
     return _db
