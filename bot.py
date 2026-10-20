@@ -13,6 +13,22 @@ from datetime import date, datetime, timedelta, timezone
 
 import requests
 
+
+def env_ints(name):
+    """Числа из переменной окружения. Кавычки, пробелы и «длинный минус» из копипасты
+    не должны ронять бота при запуске."""
+    result = []
+    for part in os.environ.get(name, "").replace(";", ",").split(","):
+        cleaned = part.strip().strip("'\"").replace("−", "-").replace("–", "-")
+        if not cleaned:
+            continue
+        try:
+            result.append(int(cleaned))
+        except ValueError:
+            print(f"Переменная {name}: не понял значение {part!r}, пропускаю")
+    return result
+
+
 # Хостинги по-разному называют переменную с токеном
 TOKEN = os.environ.get("TG_TOKEN") or os.environ.get("BOT_TOKEN") or os.environ.get("TOKEN")
 if not TOKEN:
@@ -26,9 +42,9 @@ RATE_LIMIT = 5  # не больше стольких действий от од�
 RATE_WINDOW = 30  # ...за столько секунд
 CACHE_TTL = 60  # расписание дня держим в памяти столько секунд
 # Telegram ID админов через запятую; узнать свой можно командой /myid
-ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()}
+ADMIN_IDS = set(env_ints("ADMIN_IDS"))
 # Закрытый канал с домашкой (ID вида -100XXXXXXXXXX). Пока не задан, бот сам подскажет админу ID
-HOMEWORK_CHANNEL_ID = int(os.environ.get("HOMEWORK_CHANNEL_ID") or 0) or None
+HOMEWORK_CHANNEL_ID = (env_ints("HOMEWORK_CHANNEL_ID") or [None])[0]
 # Если у хостинга есть постоянный диск, укажите путь на нём, иначе база стирается при пересборке
 DB_PATH = os.environ.get("DB_PATH") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "users.db")
 
@@ -102,8 +118,7 @@ def load_state():
     if state.get("chat_id"):  # старый формат: один чат
         subscribers.append(state["chat_id"])
     # CHAT_IDS из окружения (через запятую) нужны хостингам, где диск стирается при перезапуске
-    env_ids = os.environ.get("CHAT_IDS") or os.environ.get("CHAT_ID", "")
-    subscribers += [int(x) for x in env_ids.split(",") if x.strip()]
+    subscribers += env_ints("CHAT_IDS") or env_ints("CHAT_ID")
     return {"subscribers": list(dict.fromkeys(subscribers)), "days": state.get("days")}
 
 
@@ -621,6 +636,10 @@ def main():
     global BOT_USERNAME
     state = load_state()
     pool = ThreadPoolExecutor(max_workers=8)
+    print(
+        f"Бот запускается. Админов: {len(ADMIN_IDS)}, канал домашки: {HOMEWORK_CHANNEL_ID}, "
+        f"база: {DB_PATH}, подписчиков: {len(state['subscribers'])}"
+    )
 
     try:
         BOT_USERNAME = requests.get(f"{TG}/getMe", timeout=15).json()["result"]["username"]
