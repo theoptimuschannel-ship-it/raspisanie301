@@ -27,6 +27,8 @@ RATE_WINDOW = 30  # ...за столько секунд
 CACHE_TTL = 60  # расписание дня держим в памяти столько секунд
 # Telegram ID админов через запятую; узнать свой можно командой /myid
 ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()}
+# Закрытый канал с домашкой (ID вида -100XXXXXXXXXX). Пока не задан, бот сам подскажет админу ID
+HOMEWORK_CHANNEL_ID = int(os.environ.get("HOMEWORK_CHANNEL_ID") or 0) or None
 # Если у хостинга есть постоянный диск, укажите путь на нём, иначе база стирается при пересборке
 DB_PATH = os.environ.get("DB_PATH") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "users.db")
 
@@ -126,6 +128,10 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE TABLE IF NOT EXISTS chats (
     chat_id INTEGER PRIMARY KEY, type TEXT, title TEXT, first_seen TEXT
 );
+CREATE TABLE IF NOT EXISTS homework (
+    chat_id INTEGER, message_id INTEGER, day TEXT, PRIMARY KEY (chat_id, message_id)
+);
+CREATE INDEX IF NOT EXISTS homework_day ON homework(day);
 """
 
 
@@ -250,12 +256,22 @@ def format_lesson(x, index=None):
     return "\n".join(lines)
 
 
-def format_day(day, lessons):
+def homework_footer(links):
+    if not links:
+        return ""
+    if len(links) == 1:
+        return f'\n\n📚 <a href="{links[0]}">Домашка на этот день</a>'
+    items = ", ".join(f'<a href="{url}">пост {i}</a>' for i, url in enumerate(links, 1))
+    return f"\n\n📚 Домашка: {items}"
+
+
+def format_day(day, lessons, links=()):
     header = f"📅 <b>{day_label(day)}</b>"
+    footer = homework_footer(links)
     if not lessons:
-        return f"{header}\n\n🎉 Пар нет"
+        return f"{header}\n\n🎉 Пар нет{footer}"
     cards = [format_lesson(x, i) for i, x in enumerate(lessons, 1)]
-    return header + "\n\n" + "\n\n".join(cards)
+    return header + "\n\n" + "\n\n".join(cards) + footer
 
 
 def parse_date(text):
@@ -296,7 +312,12 @@ def diff(old_days, new_days):
 
 
 def send(chat_id, text, keyboard=False, markup=None):
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "link_preview_options": {"is_disabled": True},
+    }
     if markup or keyboard:
         payload["reply_markup"] = markup or KEYBOARD
     r = requests.post(f"{TG}/sendMessage", json=payload, timeout=15)
@@ -304,13 +325,86 @@ def send(chat_id, text, keyboard=False, markup=None):
         print("Telegram отклонил сообщение:", r.text)
         # Повторяем без разметки, чтобы ответ в любом случае дошёл
         payload.pop("parse_mode")
-        payload["text"] = re.sub(r"</?b>", "", html.unescape(text))
+        payload["text"] = re.sub(r"<[^>]+>", "", html.unescape(text))
         requests.post(f"{TG}/sendMessage", json=payload, timeout=15)
+
+
+def parse_post_date(text):
+    """Дата из заголовка поста: 'четверг 22.10.2026' или просто '22.10.2026'. Даты дальше первой
+    строки не берём: «сдать до 30.10.2026» в тексте не должно привязывать пост к другому дню."""
+    lines = [line for line in text.splitlines() if line.strip()]
+    if not lines:
+        return None
+    m = re.search(r"(\d{1,2})\.(\d{1,2})\.(\d{4})\b", lines[0])
+    if not m:
+        return None
+    d, mo, y = map(int, m.groups())
+    try:
+        return date(y, mo, d)
+    except ValueError:
+        return None
+
+
+def post_link(chat_id, message_id):
+    # Для закрытых каналов ID -100XXXXXXXXXX превращается в t.me/c/XXXXXXXXXX/<номер поста>
+    return f"https://t.me/c/{str(chat_id)[4:]}/{message_id}"
+
+
+def homework_links(day):
+    rows = db_query(
+        "SELECT chat_id, message_id FROM homework WHERE day = ? ORDER BY message_id", (day.isoformat(),)
+    )
+    return [post_link(c, m) for c, m in rows]
+
+
+seen_channels = set()
+
+
+def notify_unknown_channel(chat):
+    """Бота могли добавить в чужой канал, поэтому посты оттуда не берём; админу сообщаем ID один раз."""
+    chat_id = chat.get("id")
+    if chat_id in seen_channels:
+        return
+    seen_channels.add(chat_id)
+    title = html.escape(chat.get("title") or "без названия")
+    print(f"Пост из канала {chat_id} ({title}), HOMEWORK_CHANNEL_ID не совпадает")
+    for admin_id in ADMIN_IDS:
+        send(
+            admin_id,
+            f"📣 Бот получил пост из канала «{title}» (ID <code>{chat_id}</code>).\n"
+            f"Если это канал с домашкой, задайте переменную HOMEWORK_CHANNEL_ID = {chat_id} и перезапустите бота.",
+        )
+
+
+def handle_channel_post(post):
+    chat = post.get("chat", {})
+    if HOMEWORK_CHANNEL_ID is None or chat.get("id") != HOMEWORK_CHANNEL_ID:
+        notify_unknown_channel(chat)
+        return
+    # В постах с фото текст лежит в caption
+    day = parse_post_date(post.get("text") or post.get("caption") or "")
+    with db_lock:
+        db = get_db()
+        if day:
+            db.execute(
+                "INSERT OR REPLACE INTO homework(chat_id, message_id, day) VALUES(?,?,?)",
+                (chat["id"], post["message_id"], day.isoformat()),
+            )
+        else:  # пост отредактировали и дату убрали
+            db.execute(
+                "DELETE FROM homework WHERE chat_id = ? AND message_id = ?", (chat["id"], post["message_id"])
+            )
+        db.commit()
 
 
 def show_day(chat_id, day):
     try:
-        send(chat_id, format_day(day, fetch_day(day)), keyboard=True)
+        links = homework_links(day)
+    except Exception:
+        traceback.print_exc()
+        links = []
+    try:
+        send(chat_id, format_day(day, fetch_day(day), links), keyboard=True)
     except Exception as e:
         print("Ошибка загрузки расписания:", e)
         send(chat_id, "Не удалось получить расписание, попробуйте позже.", keyboard=True)
@@ -349,6 +443,7 @@ def admin_summary(state):
         f"<b>{one('SELECT COUNT(*) FROM chats')}</b> / "
         f"<b>{one(GROUP_CHATS_SQL)}</b>",
         f"🔔 Подписано на уведомления: <b>{len(state['subscribers'])}</b>",
+        f"📚 Постов с домашкой в базе: <b>{one('SELECT COUNT(*) FROM homework')}</b>",
     ])
 
 
@@ -513,6 +608,10 @@ def process_update(state, update):
             handle_callback(state, update["callback_query"])
         elif "message" in update:
             handle_message(state, update["message"])
+        elif "channel_post" in update:
+            handle_channel_post(update["channel_post"])
+        elif "edited_channel_post" in update:
+            handle_channel_post(update["edited_channel_post"])
     except Exception:
         traceback.print_exc()
 
@@ -537,7 +636,12 @@ def main():
     offset = None
     while True:
         try:
-            r = requests.get(f"{TG}/getUpdates", params={"timeout": 30, "offset": offset}, timeout=40)
+            params = {
+                "timeout": 30,
+                "offset": offset,
+                "allowed_updates": json.dumps(["message", "callback_query", "channel_post", "edited_channel_post"]),
+            }
+            r = requests.get(f"{TG}/getUpdates", params=params, timeout=40)
             body = r.json()
             if not body.get("ok"):
                 print("Ошибка Telegram:", body)
