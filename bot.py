@@ -5,6 +5,7 @@ import io
 import json
 import os
 import re
+import secrets
 import sqlite3
 import threading
 import time
@@ -58,7 +59,10 @@ DB_PATH = os.environ.get("DB_PATH") or os.path.join(DATA_DIR, "users.db")
 HTTP_PORT = int(os.environ.get("PORT") or os.environ.get("HTTP_PORT") or "8080")
 PUBLIC_URL = os.environ.get("PUBLIC_URL", "").strip()
 CALENDAR_STICKER = "CAACAgIAAxkBAAESFC9q2KmD_TaqN0nu1nkb6FX-oMyrLwACNToAArIOQUp3SpJnvNBKcj0E"
-WAVE_EMOJI_ID = "5472055112702629499"  # анимированный эмодзи в приветствии
+CHIPS_FLAVORS = ["Зелёный лук", "Сметана и зелень", "Краб", "Сыр"]
+CHIPS_COOLDOWN = 3 * 24 * 3600  # один талон на человека раз в 3 дня
+CHIPS_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # без похожих 0/O и 1/I
+WAVE_EMOJI_ID ="5472055112702629499"  # анимированный эмодзи в приветствии
 ICS_DAYS = 120  # на сколько дней вперёд просим расписание
 ICS_TTL = 600  # календарь пересобираем не чаще раза в 10 минут
 ics_cache = [0, ""]
@@ -104,7 +108,7 @@ ADMIN_KEYBOARD = {
     ]
 }
 
-KNOWN_COMMANDS = {"/rasp", "/rasp_off", "/start", "/stop", "/schedule", "/admin", "/myid", "/calendar"}
+KNOWN_COMMANDS = {"/rasp", "/rasp_off", "/start", "/stop", "/schedule", "/admin", "/myid", "/calendar", "/chips", "/чипсы"}
 BOT_USERNAME = None  # узнаём у Telegram при запуске
 
 state_lock = threading.Lock()
@@ -198,6 +202,10 @@ CREATE TABLE IF NOT EXISTS homework (
     chat_id INTEGER, message_id INTEGER, day TEXT, PRIMARY KEY (chat_id, message_id)
 );
 CREATE INDEX IF NOT EXISTS homework_day ON homework(day);
+CREATE TABLE IF NOT EXISTS chips (
+    code TEXT PRIMARY KEY, user_id INTEGER, flavor TEXT, issued_ts INTEGER
+);
+CREATE INDEX IF NOT EXISTS chips_user ON chips(user_id, issued_ts);
 """
 
 
@@ -549,7 +557,109 @@ def send(chat_id, text, keyboard=False, markup=None):
         # Повторяем без разметки, чтобы ответ в любом случае дошёл
         payload.pop("parse_mode")
         payload["text"] = re.sub(r"<[^>]+>", "", html.unescape(text))
-        requests.post(f"{TG}/sendMessage", json=payload, timeout=15)
+        r = requests.post(f"{TG}/sendMessage", json=payload, timeout=15)
+    try:
+        return r.json()["result"]["message_id"]  # нужен, чтобы потом править сообщение
+    except (ValueError, KeyError):
+        return None
+
+
+def edit_message(chat_id, message_id, text):
+    r = requests.post(
+        f"{TG}/editMessageText",
+        json={"chat_id": chat_id, "message_id": message_id, "text": text, "parse_mode": "HTML"},
+        timeout=15,
+    )
+    if not r.ok:
+        print("Не удалось изменить сообщение:", r.text)
+
+
+def chips_keyboard():
+    rows = [[{"text": f"🥔 {name}", "callback_data": f"chips:{i}"}] for i, name in enumerate(CHIPS_FLAVORS)]
+    return {"inline_keyboard": rows}
+
+
+def format_wait(seconds):
+    minutes = max(1, int(seconds // 60))
+    days, rest = divmod(minutes, 1440)
+    hours, mins = divmod(rest, 60)
+    if days:
+        return f"{days} д {hours} ч"
+    if hours:
+        return f"{hours} ч {mins} мин"
+    return f"{mins} мин"
+
+
+def claim_chips(user_id, flavor):
+    """Выдаём талон, если прошло 3 дня с прошлого. Проверка и запись под одной блокировкой,
+    чтобы двойное нажатие не выдало два талона. Возвращает (код, None) или (None, (прошлый талон, секунд ждать))."""
+    now = int(time.time())
+    with db_lock:
+        db = get_db()
+        last = db.execute(
+            "SELECT code, flavor, issued_ts FROM chips WHERE user_id = ? ORDER BY issued_ts DESC LIMIT 1", (user_id,)
+        ).fetchone()
+        if last and now - last[2] < CHIPS_COOLDOWN:
+            return None, (last, last[2] + CHIPS_COOLDOWN - now)
+        while True:
+            code = "".join(secrets.choice(CHIPS_CODE_ALPHABET) for _ in range(6))
+            try:
+                db.execute("INSERT INTO chips(code, user_id, flavor, issued_ts) VALUES(?,?,?,?)", (code, user_id, flavor, now))
+                break
+            except sqlite3.IntegrityError:
+                continue  # такой код уже есть
+        db.commit()
+    return code, None
+
+
+def show_chips_menu(chat_id, user_id):
+    last = db_query("SELECT code, flavor, issued_ts FROM chips WHERE user_id = ? ORDER BY issued_ts DESC LIMIT 1", (user_id,))
+    wait = last[0][2] + CHIPS_COOLDOWN - time.time() if last else 0
+    if wait > 0:
+        send(chat_id, chips_wait_text(last[0], wait))
+    else:
+        send(chat_id, "🍟 <b>Выберите чипсы</b>\nТалон выдаётся раз в 3 дня.", markup=chips_keyboard())
+
+
+def chips_wait_text(last, wait):
+    return (
+        "⏳ <b>Талон уже получен</b>\n"
+        f"🎟 Ваш талон: <code>{last[0]}</code> · {html.escape(last[1])}\n"
+        f"Следующий можно взять через <b>{format_wait(wait)}</b>."
+    )
+
+
+def give_chips(chat_id, user, flavor_index):
+    if not 0 <= flavor_index < len(CHIPS_FLAVORS):
+        return
+    flavor = CHIPS_FLAVORS[flavor_index]
+    code, blocked = claim_chips(user["id"], flavor)
+    if blocked:
+        send(chat_id, chips_wait_text(*blocked))
+        return
+    # Отдельное сообщение: меню в группе остаётся для остальных, а талон личный
+    message_id = send(chat_id, f"⏳ Выдаю чипсы {html.escape(flavor)}…\n▱▱▱▱▱")
+    if message_id:
+        for filled, mood in ((2, "🥔"), (4, "🍟"), (5, "🎁")):
+            time.sleep(0.8)
+            edit_message(chat_id, message_id, f"{mood} Выдаю чипсы {html.escape(flavor)}…\n{'▰' * filled}{'▱' * (5 - filled)}")
+        time.sleep(0.8)
+    name = html.escape(user.get("first_name") or user.get("username") or "Гость")
+    now = datetime.now(TZ).strftime("%d.%m.%Y %H:%M")
+    ticket = (
+        "🎟 <b>ТАЛОН НА ЧИПСЫ</b>\n"
+        "━━━━━━━━━━━━━━\n"
+        f"🥔 Lay's · <b>{html.escape(flavor)}</b>\n"
+        f"👤 {name}\n"
+        f"🔖 № <code>{code}</code>\n"
+        f"📅 Выдан: {now}\n"
+        "━━━━━━━━━━━━━━\n"
+        "✅ Приятного хруста! Следующий талон через 3 дня."
+    )
+    if message_id:
+        edit_message(chat_id, message_id, ticket)
+    else:
+        send(chat_id, ticket)
 
 
 def parse_post_date(text):
@@ -876,6 +986,11 @@ def handle_message(state, msg):
         send(chat_id, f"Ваш Telegram ID: <code>{user_id}</code>")
         return
 
+    if command in ("/chips", "/чипсы"):
+        track(msg.get("from"), chat, "chips_menu")
+        show_chips_menu(chat_id, user_id)
+        return
+
     if command == "/calendar":
         track(msg.get("from"), chat, "calendar")
         try:
@@ -934,6 +1049,9 @@ def handle_callback(state, cb):
     if data.startswith("d:"):
         track(user, chat, data)
         show_day(chat_id, today() + timedelta(days=int(data[2:])))
+    elif data.startswith("chips:"):
+        track(user, chat, "chips")
+        give_chips(chat_id, user, int(data[6:]))
     elif data == "custom":
         track(user, chat, "custom")
         send(chat_id, "Напишите дату в формате ДД.ММ или ДД.ММ.ГГГГ, например 25.10")
@@ -968,6 +1086,7 @@ def main():
             {"command": "rasp", "description": "Расписание и уведомления"},
             {"command": "rasp_off", "description": "Отключить уведомления"},
             {"command": "calendar", "description": "Расписание в календарь iPhone"},
+            {"command": "chips", "description": "Талон на чипсы 🍟"},
             {"command": "myid", "description": "Узнать свой Telegram ID"},
         ]
         requests.post(f"{TG}/setMyCommands", json={"commands": commands}, timeout=15)
