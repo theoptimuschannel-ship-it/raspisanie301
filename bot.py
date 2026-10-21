@@ -98,6 +98,7 @@ ADMIN_KEYBOARD = {
             {"text": "🆕 Новые", "callback_data": "adm:new"},
             {"text": "📥 CSV", "callback_data": "adm:csv"},
         ],
+        [{"text": "📣 Рассылка", "callback_data": "adm:broadcast"}],
     ]
 }
 
@@ -106,6 +107,8 @@ BOT_USERNAME = None  # узнаём у Telegram при запуске
 
 state_lock = threading.Lock()
 db_lock = threading.Lock()
+broadcast_lock = threading.Lock()
+broadcast_drafts = {}  # id админа -> id сообщения-черновика (None, пока ждём сообщение)
 _db = None
 user_actions = {}
 day_cache = {}
@@ -693,9 +696,104 @@ def send_csv(chat_id):
     )
 
 
+def broadcast_recipients(state, admin_id):
+    """Все чаты, где бот работал (лички и группы), плюс подписчики. Самому админу не шлём."""
+    chats = {row[0] for row in db_query("SELECT chat_id FROM chats WHERE type IN ('private', 'group', 'supergroup')")}
+    chats |= set(state["subscribers"])
+    chats.discard(admin_id)
+    return sorted(chats)
+
+
+def start_broadcast(admin_id):
+    with broadcast_lock:
+        broadcast_drafts[admin_id] = None  # ждём сообщение для рассылки
+    send(
+        admin_id,
+        "📣 <b>Рассылка</b>\n\nПришлите сообщение, которое нужно разослать. Можно с картинкой и подписью. "
+        "Перед отправкой я покажу, как оно будет выглядеть.\n\nОтмена: /cancel",
+    )
+
+
+def handle_broadcast_message(state, msg, text):
+    """True, если сообщение админа относится к рассылке и дальше обрабатывать его не нужно."""
+    admin_id = msg["from"]["id"]
+    command, _ = parse_command(text)
+    if command == "/broadcast" or text.strip().lower() in ("рассылка", "/рассылка"):
+        start_broadcast(admin_id)
+        return True
+    with broadcast_lock:
+        waiting = admin_id in broadcast_drafts
+    if not waiting or (command and command != "/cancel"):
+        return False
+    if command == "/cancel" or text.strip().lower() == "отмена":
+        with broadcast_lock:
+            broadcast_drafts.pop(admin_id, None)
+        send(admin_id, "Рассылка отменена.")
+        return True
+    with broadcast_lock:
+        broadcast_drafts[admin_id] = msg["message_id"]
+    count = len(broadcast_recipients(state, admin_id))
+    send(admin_id, f"👆 Так увидят получатели. Отправить в чатов: <b>{count}</b>?")
+    markup = {
+        "inline_keyboard": [[
+            {"text": "✅ Отправить", "callback_data": "bc:send"},
+            {"text": "❌ Отмена", "callback_data": "bc:cancel"},
+        ]]
+    }
+    requests.post(
+        f"{TG}/copyMessage",
+        json={"chat_id": admin_id, "from_chat_id": admin_id, "message_id": msg["message_id"], "reply_markup": markup},
+        timeout=30,
+    )
+    return True
+
+
+def run_broadcast(admin_id, message_id, recipients):
+    delivered = failed = 0
+    for chat_id in recipients:
+        for _ in range(3):
+            try:
+                body = requests.post(
+                    f"{TG}/copyMessage",
+                    json={"chat_id": chat_id, "from_chat_id": admin_id, "message_id": message_id},
+                    timeout=30,
+                ).json()
+            except (requests.RequestException, ValueError):
+                failed += 1
+                break
+            if body.get("ok"):
+                delivered += 1
+                break
+            if body.get("error_code") == 429:  # упёрлись в лимит Telegram, ждём сколько просят
+                time.sleep(body.get("parameters", {}).get("retry_after", 5) + 1)
+                continue
+            failed += 1  # бот заблокирован или удалён из чата
+            break
+        else:
+            failed += 1
+        time.sleep(0.06)  # Telegram разрешает около 30 сообщений в секунду
+    send(admin_id, f"✅ <b>Рассылка завершена</b>\nДоставлено: {delivered}\nНе доставлено: {failed} (заблокировали бота или удалили из чата)")
+
+
+def handle_broadcast_callback(state, admin_id, action):
+    with broadcast_lock:
+        message_id = broadcast_drafts.pop(admin_id, None)  # забираем черновик, чтобы нажатие дважды не разослало дважды
+    if message_id is None:
+        send(admin_id, "Черновика нет. Начните заново: /broadcast")
+    elif action == "cancel":
+        send(admin_id, "Рассылка отменена.")
+    else:
+        recipients = broadcast_recipients(state, admin_id)
+        send(admin_id, f"🚀 Отправляю в чатов: {len(recipients)}…")
+        threading.Thread(target=run_broadcast, args=(admin_id, message_id, recipients), daemon=True).start()
+
+
 def admin_action(state, chat_id, action):
     if action == "csv":
         send_csv(chat_id)
+        return
+    if action == "broadcast":
+        start_broadcast(chat_id)
         return
     texts = {"summary": lambda: admin_summary(state), "top": admin_top, "new": admin_new}
     send(chat_id, texts[action](), markup=ADMIN_KEYBOARD)
@@ -735,6 +833,10 @@ def handle_message(state, msg):
     if chat_id is None:
         return
     user_id = msg.get("from", {}).get("id", chat_id)
+
+    # Рассылка: сообщение админа может быть без текста (картинка), поэтому проверяем до остального разбора
+    if user_id in ADMIN_IDS and chat.get("type") == "private" and handle_broadcast_message(state, msg, text or msg.get("caption", "")):
+        return
 
     command, target = parse_command(text)
     if target and BOT_USERNAME and target.lower() != BOT_USERNAME.lower():
@@ -799,6 +901,12 @@ def handle_callback(state, cb):
     data = cb.get("data", "")
     user = cb.get("from", {})
     answer = {"callback_query_id": cb["id"]}
+
+    if data.startswith("bc:"):
+        requests.post(f"{TG}/answerCallbackQuery", json=answer, timeout=15)
+        if user.get("id") in ADMIN_IDS and chat.get("type") == "private":
+            handle_broadcast_callback(state, user["id"], data[3:])
+        return
 
     if data.startswith("adm:"):
         requests.post(f"{TG}/answerCallbackQuery", json=answer, timeout=15)
