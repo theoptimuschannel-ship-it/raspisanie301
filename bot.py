@@ -10,6 +10,7 @@ import threading
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import date, datetime, timedelta, timezone
 
 import requests
@@ -52,6 +53,15 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("DATA_DIR") or BASE_DIR
 DB_PATH = os.environ.get("DB_PATH") or os.path.join(DATA_DIR, "users.db")
 
+# Календарь-подписка для iPhone: бот сам отдаёт /schedule.ics на этом порту.
+# PUBLIC_URL — публичный адрес, по которому хостинг открывает бота из интернета (https://...)
+HTTP_PORT = int(os.environ.get("PORT") or os.environ.get("HTTP_PORT") or "8080")
+PUBLIC_URL = os.environ.get("PUBLIC_URL", "").strip()
+ICS_DAYS = 120  # на сколько дней вперёд просим расписание
+ICS_TTL = 600  # календарь пересобираем не чаще раза в 10 минут
+ics_cache = [0, ""]
+ics_lock = threading.Lock()
+
 API = "https://usla.unmp.ru/api/app/v1"
 TG = f"https://api.telegram.org/bot{TOKEN}"
 STATE_FILE = os.environ.get("STATE_PATH") or os.path.join(DATA_DIR, "state.json")
@@ -91,7 +101,7 @@ ADMIN_KEYBOARD = {
     ]
 }
 
-KNOWN_COMMANDS = {"/rasp", "/rasp_off", "/start", "/stop", "/schedule", "/admin", "/myid"}
+KNOWN_COMMANDS = {"/rasp", "/rasp_off", "/start", "/stop", "/schedule", "/admin", "/myid", "/calendar"}
 BOT_USERNAME = None  # узнаём у Telegram при запуске
 
 state_lock = threading.Lock()
@@ -277,6 +287,136 @@ def fetch_range(start, end):
         iso = (start + timedelta(days=i)).isoformat()
         result[iso] = {x["id"]: x for x in days.get(iso, [])}
     return result
+
+
+def ics_escape(text):
+    return text.replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,").replace("\n", "\\n")
+
+
+def ics_fold(line):
+    """Строки iCalendar длиннее 75 байт переносятся (продолжение начинается с пробела)."""
+    out, cur = [], ""
+    for ch in line:
+        if len((cur + ch).encode("utf-8")) > (75 if not out else 74):
+            out.append(cur)
+            cur = ch
+        else:
+            cur += ch
+    out.append(cur)
+    return "\r\n ".join(out)
+
+
+def build_ics():
+    """Календарь с парами: от недели назад на ICS_DAYS дней вперёд. Название и место события
+    видны в виджете экрана блокировки iPhone, поэтому кладём туда предмет и аудиторию."""
+    start = today() - timedelta(days=7)
+    end = today() + timedelta(days=ICS_DAYS)
+    days = api_get(
+        f"schedule/group/{GROUP_ID}/range",
+        {"from": start.isoformat(), "to": end.isoformat()},
+    )["days"]
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//raspisanie301//RU",
+        "CALSCALE:GREGORIAN",
+        "METHOD:PUBLISH",
+        "X-WR-CALNAME:Пары ИПиП301Б",
+        "X-WR-TIMEZONE:Asia/Yekaterinburg",
+        "REFRESH-INTERVAL;VALUE=DURATION:PT1H",
+        "X-PUBLISHED-TTL:PT1H",
+        "BEGIN:VTIMEZONE",
+        "TZID:Asia/Yekaterinburg",
+        "BEGIN:STANDARD",
+        "DTSTART:19700101T000000",
+        "TZOFFSETFROM:+0500",
+        "TZOFFSETTO:+0500",
+        "TZNAME:+05",
+        "END:STANDARD",
+        "END:VTIMEZONE",
+    ]
+    for iso in sorted(days):
+        for x in sorted(days[iso], key=lambda x: x["startTime"]):
+            day = iso.replace("-", "")
+            lesson_type = LESSON_TYPES.get(x["type"]["name"], x["type"]["name"])
+            details = [lesson_type]
+            if x["teachers"]:
+                details.append(", ".join(t["shortName"] for t in x["teachers"]))
+            event = [
+                "BEGIN:VEVENT",
+                f"UID:lesson-{x['id']}-{iso}@raspisanie301",
+                f"DTSTAMP:{stamp}",
+                f"DTSTART;TZID=Asia/Yekaterinburg:{day}T{x['startTime'].replace(':', '')}00",
+                f"DTEND;TZID=Asia/Yekaterinburg:{day}T{x['endTime'].replace(':', '')}00",
+                f"SUMMARY:{ics_escape(x['subject'])}",
+                f"DESCRIPTION:{ics_escape(chr(10).join(details))}",
+            ]
+            if x["rooms"]:
+                event.append("LOCATION:" + ics_escape("; ".join(format_room(r) for r in x["rooms"])))
+            event.append("END:VEVENT")
+            lines += event
+    lines.append("END:VCALENDAR")
+    return "\r\n".join(ics_fold(line) for line in lines) + "\r\n"
+
+
+def get_ics():
+    with ics_lock:
+        if ics_cache[0] and time.time() - ics_cache[0] < ICS_TTL:
+            return ics_cache[1]
+        ics_cache[:] = [time.time(), build_ics()]
+        return ics_cache[1]
+
+
+class CalendarHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path.split("?")[0] not in ("/schedule.ics", "/"):
+            self.send_error(404)
+            return
+        try:
+            body = get_ics().encode("utf-8")
+        except Exception as e:
+            print("Не удалось собрать календарь:", e)
+            self.send_error(502)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "text/calendar; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+def serve_calendar():
+    try:
+        ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), CalendarHandler).serve_forever()
+    except Exception as e:
+        print("Сервер календаря не запустился:", e)
+
+
+def send_calendar(chat_id):
+    if PUBLIC_URL:
+        url = PUBLIC_URL.rstrip("/") + "/schedule.ics"
+        webcal = "webcal://" + re.sub(r"^https?://", "", url)
+        send(
+            chat_id,
+            "📆 <b>Календарь для iPhone</b>\n\n"
+            f'1. Нажмите на ссылку: <a href="{webcal}">подписаться на расписание</a>\n'
+            "    (если не открывается: Настройки → Календарь → Учётные записи → "
+            "Новая → Другое → Добавить календарь подписки и вставьте <code>"
+            f"{html.escape(url)}</code>)\n"
+            "2. Расписание обновляется само, а изменения подтянутся в течение часа.\n"
+            "3. Виджет: удерживайте экран блокировки → Настроить → добавьте виджет «Календарь».",
+        )
+    else:
+        requests.post(
+            f"{TG}/sendDocument",
+            data={"chat_id": chat_id, "caption": "Откройте файл и нажмите «Добавить все». Это разовый импорт без автообновления."},
+            files={"document": ("schedule.ics", get_ics().encode("utf-8"), "text/calendar")},
+            timeout=60,
+        )
 
 
 def keycap(n):
@@ -607,6 +747,15 @@ def handle_message(state, msg):
         send(chat_id, f"Ваш Telegram ID: <code>{user_id}</code>")
         return
 
+    if command == "/calendar":
+        track(msg.get("from"), chat, "calendar")
+        try:
+            send_calendar(chat_id)
+        except Exception as e:
+            print("Календарь:", e)
+            send(chat_id, "Не удалось получить расписание, попробуйте позже.")
+        return
+
     kinds = {"/rasp": "start", "/start": "start", "/rasp_off": "stop", "/stop": "stop", "/schedule": "schedule"}
     kind = kinds.get(command, "date")
     track(msg.get("from"), chat, kind, register=kind == "start")
@@ -683,12 +832,14 @@ def main():
         commands = [
             {"command": "rasp", "description": "Расписание и уведомления"},
             {"command": "rasp_off", "description": "Отключить уведомления"},
+            {"command": "calendar", "description": "Расписание в календарь iPhone"},
             {"command": "myid", "description": "Узнать свой Telegram ID"},
         ]
         requests.post(f"{TG}/setMyCommands", json={"commands": commands}, timeout=15)
     except Exception as e:
         print("Не удалось получить имя бота или задать команды:", e)
     threading.Thread(target=watcher, args=(state,), daemon=True).start()
+    threading.Thread(target=serve_calendar, daemon=True).start()
 
     offset = None
     while True:
