@@ -396,27 +396,44 @@ def serve_calendar():
         print("Сервер календаря не запустился:", e)
 
 
-def send_calendar(chat_id):
+def calendar_instruction():
+    widget = (
+        "<b>Виджет на экран блокировки</b>\n"
+        "Удерживайте экран блокировки → <b>Настроить</b> → <b>Добавить виджеты</b> → <b>Календарь</b>. "
+        "Он покажет ближайшую пару, время и аудиторию."
+    )
     if PUBLIC_URL:
         url = PUBLIC_URL.rstrip("/") + "/schedule.ics"
-        webcal = "webcal://" + re.sub(r"^https?://", "", url)
-        send(
-            chat_id,
-            "📆 <b>Календарь для iPhone</b>\n\n"
-            f'1. Нажмите на ссылку: <a href="{webcal}">подписаться на расписание</a>\n'
-            "    (если не открывается: Настройки → Календарь → Учётные записи → "
-            "Новая → Другое → Добавить календарь подписки и вставьте <code>"
-            f"{html.escape(url)}</code>)\n"
-            "2. Расписание обновляется само, а изменения подтянутся в течение часа.\n"
-            "3. Виджет: удерживайте экран блокировки → Настроить → добавьте виджет «Календарь».",
+        return (
+            "📲 <b>Как добавить в календарь iPhone</b>\n\n"
+            "<b>1.</b> Скопируйте ссылку (нажмите на неё):\n"
+            f"<code>{html.escape(url)}</code>\n\n"
+            "<b>2.</b> Откройте <b>Настройки → Календарь → Учётные записи</b>\n"
+            "<b>3.</b> <b>Новая учётная запись → Другое → Добавить календарь подписки</b>\n"
+            "<b>4.</b> Вставьте ссылку в поле «Сервер» → <b>Далее → Сохранить</b>\n\n"
+            "🔄 Расписание будет обновляться само.\n\n"
+            "🔒 " + widget
         )
-    else:
-        requests.post(
-            f"{TG}/sendDocument",
-            data={"chat_id": chat_id, "caption": "Откройте файл и нажмите «Добавить все». Это разовый импорт без автообновления."},
-            files={"document": ("schedule.ics", get_ics().encode("utf-8"), "text/calendar")},
-            timeout=60,
-        )
+    return (
+        "📲 <b>Как добавить в календарь iPhone</b>\n\n"
+        "<b>1.</b> Нажмите на файл → «Поделиться» → <b>Сохранить в Файлы</b>\n"
+        "<b>2.</b> Откройте файл в «Файлах» → <b>Добавить все</b>\n\n"
+        "Это разовый импорт: при изменении расписания его надо повторить.\n\n"
+        "🔒 " + widget
+    )
+
+
+def send_calendar(chat_id):
+    send(chat_id, "⏳ Загружаю календарь…")
+    ics = get_ics().encode("utf-8")
+    r = requests.post(
+        f"{TG}/sendDocument",
+        data={"chat_id": chat_id},
+        files={"document": ("schedule.ics", ics, "text/calendar")},
+        timeout=60,
+    )
+    r.raise_for_status()
+    send(chat_id, calendar_instruction())
 
 
 def keycap(n):
