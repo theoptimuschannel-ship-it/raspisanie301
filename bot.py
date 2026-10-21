@@ -57,6 +57,7 @@ DB_PATH = os.environ.get("DB_PATH") or os.path.join(DATA_DIR, "users.db")
 # PUBLIC_URL — публичный адрес, по которому хостинг открывает бота из интернета (https://...)
 HTTP_PORT = int(os.environ.get("PORT") or os.environ.get("HTTP_PORT") or "8080")
 PUBLIC_URL = os.environ.get("PUBLIC_URL", "").strip()
+CALENDAR_STICKER = "CAACAgIAAxkBAAESFC9q2KmD_TaqN0nu1nkb6FX-oMyrLwACNToAArIOQUp3SpJnvNBKcj0E"
 ICS_DAYS = 120  # на сколько дней вперёд просим расписание
 ICS_TTL = 600  # календарь пересобираем не чаще раза в 10 минут
 ics_cache = [0, ""]
@@ -437,6 +438,10 @@ def send_calendar(chat_id):
     )
     r.raise_for_status()
     send(chat_id, calendar_instruction())
+    try:
+        requests.post(f"{TG}/sendSticker", json={"chat_id": chat_id, "sticker": CALENDAR_STICKER}, timeout=15)
+    except requests.RequestException as e:
+        print("Стикер не отправился:", e)  # без стикера календарь всё равно выдан
 
 
 def keycap(n):
