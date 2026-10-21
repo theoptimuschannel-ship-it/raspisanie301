@@ -1,3 +1,4 @@
+import base64
 import csv
 import html
 import io
@@ -45,12 +46,15 @@ CACHE_TTL = 60  # расписание дня держим в памяти ст�
 ADMIN_IDS = set(env_ints("ADMIN_IDS"))
 # Закрытый канал с домашкой (ID вида -100XXXXXXXXXX). Пока не задан, бот сам подскажет админу ID
 HOMEWORK_CHANNEL_ID = (env_ints("HOMEWORK_CHANNEL_ID") or [None])[0]
-# Если у хостинга есть постоянный диск, укажите путь на нём, иначе база стирается при пересборке
-DB_PATH = os.environ.get("DB_PATH") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "users.db")
+# Если у хостинга есть постоянный диск, укажите путь на нём, иначе база стирается при пересборке.
+# DATA_DIR (BotHost задаёт его сам: /app/data) используется по умолчанию, DB_PATH и STATE_PATH его перекрывают
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.environ.get("DATA_DIR") or BASE_DIR
+DB_PATH = os.environ.get("DB_PATH") or os.path.join(DATA_DIR, "users.db")
 
 API = "https://usla.unmp.ru/api/app/v1"
 TG = f"https://api.telegram.org/bot{TOKEN}"
-STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
+STATE_FILE = os.environ.get("STATE_PATH") or os.path.join(DATA_DIR, "state.json")
 
 TZ = timezone(timedelta(hours=5))  # Екатеринбург
 WEEKDAYS = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
@@ -107,7 +111,39 @@ def rate_limited(user_id):
     return limited
 
 
+def restore_base64_file(path, is_valid):
+    """Файловый менеджер хостинга может сохранить загруженный файл как base64-текст.
+    Если файл не проходит проверку, но после раскодирования проходит, подменяем его настоящим
+    (исходный остаётся рядом как .base64). Любой сбой тихо игнорируем, бот не должен падать."""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+        if not raw or is_valid(raw):
+            return
+        decoded = base64.b64decode(raw, validate=False)
+        if not is_valid(decoded):
+            return
+        with open(path + ".base64", "wb") as f:
+            f.write(raw)
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(decoded)
+        os.replace(tmp, path)
+        print(f"Файл {path} был в base64, восстановлен ({len(raw)} -> {len(decoded)} байт)")
+    except Exception as e:
+        print(f"restore_base64_file({path}): {e}")
+
+
+def _is_json(raw):
+    try:
+        json.loads(raw.decode("utf-8-sig"))
+        return True
+    except Exception:
+        return False
+
+
 def load_state():
+    restore_base64_file(STATE_FILE, _is_json)
     try:
         with open(STATE_FILE, encoding="utf-8") as f:
             state = json.load(f)
@@ -155,6 +191,7 @@ def get_db():
     global _db
     if _db is None:
         os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+        restore_base64_file(DB_PATH, lambda raw: raw.startswith(b"SQLite format 3\x00"))
         _db = sqlite3.connect(DB_PATH, check_same_thread=False)
         _db.executescript(SCHEMA)
     return _db
