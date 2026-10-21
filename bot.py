@@ -348,17 +348,21 @@ def build_ics():
             details = [lesson_type]
             if x["teachers"]:
                 details.append(", ".join(t["shortName"] for t in x["teachers"]))
+            rooms = "; ".join(format_room(r) for r in x["rooms"])
+            # Виджет экрана блокировки показывает только название и время, а место часто прячет.
+            # Аудитория стоит в начале названия: длинный предмет обрежется с конца, а она останется видна
+            title = f"{rooms} · {x['subject']}" if rooms else x["subject"]
             event = [
                 "BEGIN:VEVENT",
                 f"UID:lesson-{x['id']}-{iso}@raspisanie301",
                 f"DTSTAMP:{stamp}",
                 f"DTSTART;TZID=Asia/Yekaterinburg:{day}T{x['startTime'].replace(':', '')}00",
                 f"DTEND;TZID=Asia/Yekaterinburg:{day}T{x['endTime'].replace(':', '')}00",
-                f"SUMMARY:{ics_escape(x['subject'])}",
+                f"SUMMARY:{ics_escape(title)}",
                 f"DESCRIPTION:{ics_escape(chr(10).join(details))}",
             ]
-            if x["rooms"]:
-                event.append("LOCATION:" + ics_escape("; ".join(format_room(r) for r in x["rooms"])))
+            if rooms:
+                event.append("LOCATION:" + ics_escape(rooms))
             event.append("END:VEVENT")
             lines += event
     lines.append("END:VCALENDAR")
