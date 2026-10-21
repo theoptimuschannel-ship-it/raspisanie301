@@ -58,6 +58,7 @@ DB_PATH = os.environ.get("DB_PATH") or os.path.join(DATA_DIR, "users.db")
 HTTP_PORT = int(os.environ.get("PORT") or os.environ.get("HTTP_PORT") or "8080")
 PUBLIC_URL = os.environ.get("PUBLIC_URL", "").strip()
 CALENDAR_STICKER = "CAACAgIAAxkBAAESFC9q2KmD_TaqN0nu1nkb6FX-oMyrLwACNToAArIOQUp3SpJnvNBKcj0E"
+WAVE_EMOJI_ID = "5472055112702629499"  # анимированный эмодзи в приветствии
 ICS_DAYS = 120  # на сколько дней вперёд просим расписание
 ICS_TTL = 600  # календарь пересобираем не чаще раза в 10 минут
 ics_cache = [0, ""]
@@ -888,7 +889,7 @@ def handle_message(state, msg):
         if chat_id not in state["subscribers"]:
             state["subscribers"].append(chat_id)
             save_state(state)
-        send(chat_id, "👋 Какой день?", keyboard=True)
+        send(chat_id, f'<tg-emoji emoji-id="{WAVE_EMOJI_ID}">👋</tg-emoji> Какой день?', keyboard=True)
     elif kind == "stop":
         if chat_id in state["subscribers"]:
             state["subscribers"].remove(chat_id)
